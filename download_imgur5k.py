@@ -24,6 +24,7 @@ import json
 import numpy as np
 import os
 import requests
+import tqdm.contrib.concurrent
 
 from PIL import Image
 
@@ -73,6 +74,43 @@ def _create_split_json(anno_json, _split_idx):
 
     return split_json
 
+def dl(index, hash_, invalid_urls, args):
+    output_file = f'{args.output_dir}/{index}.jpg'
+    try:
+        h = compute_image_hash(output_file)
+        if h == hash_:
+            return (1, 1)
+    except FileNotFoundError:
+        pass
+    headers = {
+        'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/58.0.3029.110 Safari/537.3'
+    }
+    image_url = f'https://i.imgur.com/{index}.jpg'
+    img_data = requests.get(image_url, headers=headers).content
+    if len(img_data) < 100:
+        print(f"URL retrieval for {index} failed!!\n")
+        invalid_urls.append(image_url)
+        return (0, 0)
+    with open(output_file, 'wb') as handler:
+        handler.write(img_data)
+
+    h = compute_image_hash(output_file)
+    if h == "d835884373f4d6c8f24742ceabe74946":
+        print(f"For IMG: {index}: HTTP 404")
+        os.remove(output_file)
+        invalid_urls.append(image_url)
+        return (1, 0)
+    if hash_ != h:
+        print(f"For IMG: {index}, ref hash: {hash_} != cur hash: {h}")
+        os.remove(output_file)
+        invalid_urls.append(image_url)
+        return (1, 0)
+    else:
+        return (1, 1)
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -85,36 +123,22 @@ def main():
         for hash in hashes:
             hash_dict[f"{hash.split()[0]}"] = f"{hash.split()[1]}"
 
-
     tot_evals = 0
     num_match = 0
     invalid_urls = []
     # Download the urls and save only the ones with valid hash o ensure underlying image has not changed
-    for index in list(hash_dict.keys()):
-        image_url = f'https://i.imgur.com/{index}.jpg'
-        img_data = requests.get(image_url).content
-        if len(img_data) < 100:
-            print(f"URL retrieval for {index} failed!!\n")
-            invalid_urls.append(image_url)
-            continue
-        with open(f'{args.output_dir}/{index}.jpg', 'wb') as handler:
-            handler.write(img_data)
-
-        compute_image_hash(f'{args.output_dir}/{index}.jpg')
-        tot_evals += 1
-        if hash_dict[index] != compute_image_hash(f'{args.output_dir}/{index}.jpg'):
-            print(f"For IMG: {index}, ref hash: {hash_dict[index]} != cur hash: {compute_image_hash(f'{args.output_dir}/{index}.jpg')}")
-            os.remove(f'{args.output_dir}/{index}.jpg')
-            invalid_urls.append(image_url)
-            continue
-        else:
-            num_match += 1
+    for evals, matches in tqdm.contrib.concurrent.thread_map(
+        lambda index: dl(index, hash_dict[index], invalid_urls, args),
+        hash_dict
+    ):
+        tot_evals += evals
+        num_match += matches
 
     # Generate the final annotations file
     # Format: { "index_id" : {indexes}, "index_to_annotation_map" : { annotations ids for an index}, "annotation_id": { each annotation's info } }
     # Bounding boxes with '.' mean the annotations were not done for various reasons
 
-    _F = np.loadtxt(f'{args.dataset_info_dir}/imgur5k_data.lst', delimiter="\t", dtype=np.str, encoding="utf-8")
+    _F = np.loadtxt(f'{args.dataset_info_dir}/imgur5k_data.lst', delimiter="\t", dtype=str, encoding="utf-8")
     anno_json = {}
 
     anno_json['index_id'] = {}
@@ -142,7 +166,7 @@ def main():
     # Now split the annotations json in train, validation and test jsons
     splits = ['train', 'val', 'test']
     for split in splits:
-        _split_idx = np.loadtxt(f'{args.dataset_info_dir}/{split}_index_ids.lst', delimiter="\n", dtype=np.str)
+        _split_idx = np.loadtxt(f'{args.dataset_info_dir}/{split}_index_ids.lst', dtype=str)
         split_json = _create_split_json(anno_json, _split_idx)
         json.dump(split_json, open(f'{args.dataset_info_dir}/imgur5k_annotations_{split}.json', 'w'), indent=4)
 
